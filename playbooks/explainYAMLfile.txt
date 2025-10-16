@@ -1,0 +1,348 @@
+---
+# playbooks/nhc_slurm.yml (final fixed, role-aware nhc.conf + retry)
+
+- name: Install NHC & integrate with Slurm (containers)
+  hosts: slurm_master:slurm_nodes
+  gather_facts: false
+  become: false
+
+ここではnhcのインストールバージョンと、インストール先を指定しています。
+  vars:
+    nhc_version: "1.4.3"
+    nhc_prefix: "/usr"
+    nhc_sysconfdir: "/etc"
+    nhc_libexecdir: "/usr/libexec"
+    build_dir: "/tmp/nhc-src"
+    run_unit_tests: true
+
+ここではありとあらゆる方法（dnf, yum, apt-get）でpython3.9以上のバージョンをインストールするようにしています。
+  pre_tasks:
+    - name: Ensure modern Python (>=3.9) exists and is /usr/bin/python3
+      raw: |
+        set -e
+        install_py () {
+          if command -v dnf >/dev/null 2>&1; then
+            dnf -y install python3.11 || dnf -y install python3.10 || dnf -y install python3.9 || dnf -y install python3
+          elif command -v yum >/dev/null 2>&1; then
+            yum -y install python3 || true
+          elif command -v apt-get >/dev/null 2>&1; then
+            apt-get update
+            apt-get -y install python3.11 || apt-get -y install python3.10 || apt-get -y install python3.9 || apt-get -y install python3
+          else
+            echo "No supported package manager found"; exit 1
+          fi
+        }
+        ver_ok () { /usr/bin/python3 -c "import sys; exit(0 if sys.version_info[:2] >= (3,9) else 1)" >/dev/null 2>&1; }
+        if ! command -v /usr/bin/python3 >/dev/null 2>&1 || ! ver_ok; then
+          install_py
+          for CAND in /usr/bin/python3.11 /usr/bin/python3.10 /usr/bin/python3.9 /usr/bin/python3; do
+            if [ -x "$CAND" ]; then
+              ln -sf "$CAND" /usr/bin/python3
+              break
+            fi
+          done
+        fi
+        /usr/bin/python3 -c "import sys; m,M=sys.version_info[:2]; assert (m,M)>=(3,9), f'Python {m}.{M} too old'; print(f'Using Python {m}.{M}')"
+      changed_when: false
+Ansible の setup モジュールを明示実行して “facts（対象ノードのシステム情報）” を収集する
+    - name: Gather facts after Python >=3.9 is available
+      setup:
+
+  tasks:
+  ビルド依存パッケージの導入。先ほど同様にありとあらゆる方法（dnf, yum, apt-get）でビルドに必要なパッケージをインストールするようにしています。
+    - name: Install build deps using native package manager (no python-dnf needed)
+      shell: |
+        set -e
+        if command -v dnf >/dev/null 2>&1; then
+          dnf -y install make gcc procps-ng iproute tar gzip bzip2 xz wget
+        elif command -v yum >/dev/null 2>&1; then
+          yum -y install make gcc tar gzip bzip2 xz wget || true
+          yum -y install procps-ng iproute || yum -y install procps iproute
+        elif command -v apt-get >/dev/null 2>&1; then
+          apt-get update
+          apt-get -y install build-essential procps iproute2 tar gzip bzip2 xz-utils wget
+        else
+          echo "No supported package manager found" >&2
+          exit 1
+        fi
+      上記のスクリプトをbashで実行するようにしています。
+      args:
+        executable: /bin/bash
+file モジュールで {{ build_dir }}（例：/tmp/nhc-src）が存在しなければ作る、あれば何もしない
+    - name: Create build dir
+      file:
+        path: "{{ build_dir }}"
+        state: directory
+
+get_url で GitHub Releases から nhc_version（例：1.4.3）に対応する tar.xz を リモート先ノードへ直接ダウンロード。
+    - name: Download NHC release tarball
+      get_url:
+        url: "https://github.com/mej/nhc/releases/download/{{ nhc_version }}/lbnl-nhc-{{ nhc_version }}.tar.xz"
+        dest: "{{ build_dir }}/lbnl-nhc-{{ nhc_version }}.tar.xz"
+        mode: "0644" ダウンロードしたファイルのパーミッションを 0644 にする。読み取り可能にする。
+
+src はリモート側に保存済みの tar.xz（直前の get_url で取得）。
+remote_src: true で「ローカルではなくリモートにあるアーカイブを展開する」指定。
+    - name: Extract NHC
+      unarchive:
+        src: "{{ build_dir }}/lbnl-nhc-{{ nhc_version }}.tar.xz"　保存したNHCを展開する。
+        dest: "{{ build_dir }}"
+        remote_src: true
+        extra_opts: [ "--strip-components=1" ]
+
+    - name: Configure NHC
+      args:
+        chdir: "{{ build_dir }}"
+      shell: |
+        ./configure \
+          --prefix={{ nhc_prefix }} \
+          --sysconfdir={{ nhc_sysconfdir }} \
+          --libexecdir={{ nhc_libexecdir }}
+        このコマンドでNHCをビルドする。
+  
+ユニットテストを実行する。
+    - name: Run unit tests (optional)
+      when: run_unit_tests
+      args:
+        chdir: "{{ build_dir }}"
+      shell: make test
+      register: test_out
+      changed_when: false
+      failed_when: false
+ユニットテストの結果を表示する。
+    - name: Print unit test summary (when run)
+      when: run_unit_tests
+      debug:
+        var: test_out.stdout_lines
+
+変数 run_unit_tests が true のときだけ実行（デフォルト true。-e run_unit_tests=false でスキップ可能）。
+make test の結果を register: test_out に格納（後続の debug で出力確認できる）。
+changed_when: false … テストは状態を変えるものではない前提なので、Ansible の「changed」判定にしない。
+failed_when: false … テスト失敗でもプレイブックを止めない（検証用。CI などで厳格にしたい場合は true にして落とす）。
+目的：ビルド環境や依存が妥当か、NHC の基本機能が通るかを軽く自己診断するため。
+最小限の状況で問題がないのかを確認し、次のステップに進むようにする。これがユニットテスト
+
+ビルト済みのNHCをmake installでインストールする。
+    - name: Install NHC
+      args:
+        chdir: "{{ build_dir }}"
+      shell: make install
+
+NHCの設定ディレクトリを作成する。
+    - name: Ensure /etc/nhc exists
+      file:
+        path: /etc/nhc
+        state: directory
+        mode: "0755"
+
+自動生成ツールを使用してnhc.conf.autoを作成する。
+    - name: Generate initial nhc.conf.auto per node (best-effort)
+      shell: /usr/sbin/nhc-genconf -H "*" -c - > /etc/nhc/nhc.conf.auto
+      args:
+        executable: /bin/bash
+      register: genconf_out
+      changed_when: true
+      failed_when: false
+
+    # --- baseline nhc.conf (role-aware) ---
+    ここからはロール別のnhc.confを作成する。まずはslurmctldのnhc.confを作成する。
+    - name: Install baseline nhc.conf for controller (slurmctld)
+      copy:
+        dest: /etc/nhc/nhc.conf
+        mode: "0644"
+        content: |
+          # Container-friendly baseline checks (controller)
+          * || check_fs_mount_rw /
+          * || check_ps_daemon slurmctld slurm
+          * || check_hw_physmem 1k 2TB
+          * || check_hw_swap 0 2TB
+          * || check_hw_swap_free 0
+          * || check_hw_eth eth0
+      when: inventory_hostname in groups['slurm_master']
+
+    - name: Install baseline nhc.conf for compute nodes (slurmd)
+      copy:
+        dest: /etc/nhc/nhc.conf
+        mode: "0644"
+        content: |
+          # Container-friendly baseline checks (compute)
+          * || check_fs_mount_rw / 
+          * || check_ps_daemon slurmd root
+          * || check_hw_physmem 1k 2TB
+          * || check_hw_swap 0 2TB
+          * || check_hw_swap_free 0
+          * || check_hw_eth eth0
+      when: inventory_hostname in groups['slurm_nodes']
+
+    - name: Ensure /var/log exists (for nhc.log)
+      file:
+        path: /var/log
+        state: directory
+        mode: "0755"
+
+以下ではユニットテストのようにドライランを実行する。
+/usr/sbin/nhc をそのまま実行＝現在の nhc.conf のチェックを走らせます。
+register: nhc_first_run に実行結果（stdout/stderr/rc）を保存。
+until: nhc_first_run.rc == 0 で終了コードが0（= 全チェック合格）になるまでリトライ。
+retries: 5、delay: 2 → 最大5回、2秒間隔で再試行。
+目的は起動直後のゆらぎ（slurmd がまだ上がってない、ネットIFがまだ up してない等）を吸収すること。
+changed_when: false → ドライランは状態変更ではない扱いにして、Ansible の「changed」を出さない。
+
+    - name: Dry run NHC with small retries (allow startup jitter)
+      shell: /usr/sbin/nhc
+      register: nhc_first_run
+      changed_when: false
+      retries: 5
+      delay: 2
+      until: nhc_first_run.rc == 0
+
+    - name: Show NHC dry run result
+      debug:
+        var: nhc_first_run
+
+    # ここから追記 ーーーーーーーーーーーーーーーーーーーーーーーーーー
+
+    - name: Ensure NHC scripts dir exists (for custom checks)
+      file:
+        path: /etc/nhc/scripts
+        state: directory
+        mode: "0755"
+
+以下ではカスタムログ監視スクリプトをインストールする。
+check_log_matches関数はログファイルの差分監視による異常検知機能を追加する。
+指定ログに 新しく追記された部分だけを正規表現でサーチし、ヒットしたら NHC を失敗（=ノード DRAIN へ）にする。
+/etc/nhc/nhc.conf にルールを追加すると有効化される。
+
+    - name: Install custom logwatch check module (diff-based, rotation-tolerant)
+      copy:
+        dest: /etc/nhc/scripts/logwatch.nhc
+        mode: "0644"
+        content: |
+          # /etc/nhc/scripts/logwatch.nhc
+          # check_log_matches <logfile> <regex>
+          # - logfileが無い/読めない時は成功扱い（誤検知回避）
+          # - 前回の読み取り位置を保存し（/var/run/nhc/…）、追記分のみ grep -E <regex>
+          # - ローテーション（inode変化）時は先頭から再読込
+          function check_log_matches() {
+            local LOG="$1" #監視したいログファイルのパス
+            local REGEX="$2" #検索する正規表現
+            if [[ -z "$LOG" || -z "$REGEX" ]]; then
+              nhc_error "check_log_matches: usage: check_log_matches <logfile> <regex>"
+              return 1
+            fi
+            #必須引数がなければ NHCの規約に沿ってエラーを出し（nhc_error）、**失敗（1）**で返す。
+
+ログが存在しない/読めない場合は成功（0）扱いで返す。
+            if [[ ! -r "$LOG" ]]; then
+              return 0
+            fi
+
+**読み取り状態（どこまで読んだか）**を保存するディレクトリとファイルを決める。
+            local STATE_DIR="/var/run/nhc"
+            local BASE="$(basename -- "$LOG")"
+            local STATE="${STATE_DIR}/logwatch.${BASE}.state"
+            mkdir -p "$STATE_DIR"
+
+前回の読み取り位置を保存するファイルがあれば読み込む。
+            local LAST_INO="" LAST_OFF=""
+            if [[ -f "$STATE" ]]; then
+              read -r LAST_INO LAST_OFF < "$STATE" || true
+            fi
+
+**現在のログファイルのinode番号とサイズを取得する。**
+            local CUR_INO CUR_SIZE
+            CUR_INO="$(stat -Lc '%i' "$LOG" 2>/dev/null || stat -f %i "$LOG")"
+            CUR_SIZE="$(stat -Lc '%s' "$LOG" 2>/dev/null || stat -f %z "$LOG")"
+
+読み始め位置（START）を決定。
+同じ inode（= ログがローテーションで別ファイルに変わっていない）かつ 前回オフセットがあれば、そこから再開（追記分だけ読む）。
+inode が変わっていたら（= ローテーション）先頭（0）から読む。
+            local START=0
+            if [[ -n "$LAST_INO" && "$LAST_INO" == "$CUR_INO" && -n "$LAST_OFF" ]]; then
+              START="$LAST_OFF"
+            fi
+
+
+            local HIT
+            HIT="$( dd if="$LOG" bs=1 skip="$START" 2>/dev/null | grep -E "$REGEX" || true )"
+
+実際の差分読み。
+dd で START バイト分をスキップして、追記分のみを標準出力へ。
+それを grep -E（拡張正規表現）に渡してパターンマッチ。
+マッチしなければ grep は非0で落ちるが、|| true で関数全体を落とさない（HIT は空文字になる）。
+bs=1 は1バイト単位でのスキップでシンプル＆確実（巨大ファイルでは遅くなる可能性はあるが、読むのは追記分だけなので通常はOK）。
+
+            echo "$CUR_INO $CUR_SIZE" > "$STATE" 読み取り位置を保存・更新する。
+
+マッチが1行でもあれば NHC 規約に従って nhc_error を出し、失敗（1）で返す。
+→ NHC 全体としては「チェック失敗」になり、Slurm 側ではノード DRAIN の理由としてこのメッセージが残る。
+            if [[ -n "$HIT" ]]; then
+              nhc_error "check_log_matches: matched in $LOG : $(echo "$HIT" | head -n1)"
+              return 1
+            fi
+            return 0
+          }
+
+    - name: Ensure basic log-based NHC rules (quick win)
+      blockinfile:
+        path: /etc/nhc/nhc.conf
+        marker: "# {mark} NHC log-based rules"
+        block: |
+          # 即効性（存在すれば監視／無ければスキップ）
+          * || check_file_test -r -s /tmp/nhc_test.log
+          * || check_file_contents /tmp/nhc_test.log '/FATAL|PANIC|Out of memory|OOM/'
+          #正規表現がヒットしたら失敗
+
+          # dmesg の危険サイン（環境によりノイズが出る場合は調整）
+          * || check_cmd_output -m '/(segfault|I\/O error|corruption|Read-only file system)/i' dmesg
+          * || check_cmd_output -m '/(Out of memory|oom-killer)/i' dmesg
+1行目：セグフォ/IOエラー/FS R/O / corruption
+2行目：OOM/oom-killer
+
+          # 差分監視版（本命）。存在するログだけ評価。
+          # * || check_log_matches /var/log/syslog   'FATAL|PANIC|segfault|I/O error|corruption|Read-only file system'
+          # * || check_log_matches /var/log/messages 'FATAL|PANIC|segfault|I/O error|corruption|Read-only file system'
+          # * || check_log_matches /var/log/kern.log 'segfault|I/O error|corruption|Read-only file system'
+
+          # GPU Xid（将来ONに）:
+          * || check_log_matches /var/log/kern.log  '(^| )Xid (31|43|72|79)'
+          * || check_log_matches /var/log/syslog    '(^| )Xid (31|43|72|79)'
+      when: inventory_hostname in groups['slurm_nodes'] or inventory_hostname in groups['slurm_master']
+
+
+- name: Wire Slurm HealthCheck on master and nodes
+  hosts: slurm_master:slurm_nodes
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Ensure HealthCheckProgram in slurm.conf
+      lineinfile:
+        path: /etc/slurm/slurm.conf
+        regexp: '^HealthCheckProgram='
+        line: 'HealthCheckProgram=/usr/sbin/nhc'
+        insertafter: EOF
+slurm.conf に HealthCheckProgram=/usr/sbin/nhc を存在保証します。
+regexp に合う行があれば置換、無ければファイル末尾（EOF）に追記。
+/usr/sbin/nhc を絶対パスで指定しているので、PATH 差異のある環境でも確実に実行されます。
+
+    - name: Ensure HealthCheckInterval in slurm.conf
+      lineinfile:
+        path: /etc/slurm/slurm.conf
+        regexp: '^HealthCheckInterval='
+        line: 'HealthCheckInterval=300'
+        insertafter: EOF
+HealthCheckInterval=300 を同様に存在保証（300秒=5分ごとにチェック）。
+つまり slurmd が 5 分おきに NHC を実行し、失敗ならノードを DRAIN します。
+
+slurmctld に設定再読み込みを指示する
+- name: Reconfigure Slurm controller コントロールノードのみ
+  hosts: slurm_master
+  gather_facts: false
+  become: false
+  tasks:
+    - name: scontrol reconfigure
+      shell: scontrol reconfigure
+      register: reconfig
+      changed_when: "'No change in state' not in reconfig.stdout"
+    - debug:
+        var: reconfig.stdout

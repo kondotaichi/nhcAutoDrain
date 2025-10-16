@@ -1,0 +1,336 @@
+---
+# playbooks/nhc_slurm.yml (final fixed, role-aware nhc.conf + retry)
+
+- name: Install NHC & integrate with Slurm (containers)
+  hosts: slurm_master:slurm_nodes
+  gather_facts: false
+  become: false
+
+  vars:
+    nhc_version: "1.4.3"
+    nhc_prefix: "/usr"
+    nhc_sysconfdir: "/etc"
+    nhc_libexecdir: "/usr/libexec"
+    build_dir: "/tmp/nhc-src"
+    run_unit_tests: true
+
+  pre_tasks:
+    - name: Ensure modern Python (>=3.9) exists and is /usr/bin/python3
+      raw: |
+        set -e
+        install_py () {
+          if command -v dnf >/dev/null 2>&1; then
+            dnf -y install python3.11 || dnf -y install python3.10 || dnf -y install python3.9 || dnf -y install python3
+          elif command -v yum >/dev/null 2>&1; then
+            yum -y install python3 || true
+          elif command -v apt-get >/dev/null 2>&1; then
+            apt-get update
+            apt-get -y install python3.11 || apt-get -y install python3.10 || apt-get -y install python3.9 || apt-get -y install python3
+          else
+            echo "No supported package manager found"; exit 1
+          fi
+        }
+        ver_ok () { /usr/bin/python3 -c "import sys; exit(0 if sys.version_info[:2] >= (3,9) else 1)" >/dev/null 2>&1; }
+        if ! command -v /usr/bin/python3 >/dev/null 2>&1 || ! ver_ok; then
+          install_py
+          for CAND in /usr/bin/python3.11 /usr/bin/python3.10 /usr/bin/python3.9 /usr/bin/python3; do
+            if [ -x "$CAND" ]; then
+              ln -sf "$CAND" /usr/bin/python3
+              break
+            fi
+          done
+        fi
+        /usr/bin/python3 -c "import sys; m,M=sys.version_info[:2]; assert (m,M)>=(3,9), f'Python {m}.{M} too old'; print(f'Using Python {m}.{M}')"
+      changed_when: false
+
+    - name: Gather facts after Python >=3.9 is available
+      setup:
+
+  tasks:
+    - name: Install build deps using native package manager (no python-dnf needed)
+      shell: |
+        set -e
+        if command -v dnf >/dev/null 2>&1; then
+          dnf -y install make gcc procps-ng iproute tar gzip bzip2 xz wget
+        elif command -v yum >/dev/null 2>&1; then
+          yum -y install make gcc tar gzip bzip2 xz wget || true
+          yum -y install procps-ng iproute || yum -y install procps iproute
+        elif command -v apt-get >/dev/null 2>&1; then
+          apt-get update
+          apt-get -y install build-essential procps iproute2 tar gzip bzip2 xz-utils wget
+        else
+          echo "No supported package manager found" >&2
+          exit 1
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Create build dir
+      file:
+        path: "{{ build_dir }}"
+        state: directory
+
+    - name: Download NHC release tarball
+      get_url:
+        url: "https://github.com/mej/nhc/releases/download/{{ nhc_version }}/lbnl-nhc-{{ nhc_version }}.tar.xz"
+        dest: "{{ build_dir }}/lbnl-nhc-{{ nhc_version }}.tar.xz"
+        mode: "0644"
+
+    - name: Extract NHC
+      unarchive:
+        src: "{{ build_dir }}/lbnl-nhc-{{ nhc_version }}.tar.xz"
+        dest: "{{ build_dir }}"
+        remote_src: true
+        extra_opts: [ "--strip-components=1" ]
+
+    - name: Configure NHC
+      args:
+        chdir: "{{ build_dir }}"
+      shell: |
+        ./configure \
+          --prefix={{ nhc_prefix }} \
+          --sysconfdir={{ nhc_sysconfdir }} \
+          --libexecdir={{ nhc_libexecdir }}
+    - name: Run unit tests (optional)
+      when: run_unit_tests
+      args:
+        chdir: "{{ build_dir }}"
+      shell: make test
+      register: test_out
+      changed_when: false
+      failed_when: false
+
+    - name: Print unit test summary (when run)
+      when: run_unit_tests
+      debug:
+        var: test_out.stdout_lines
+
+    - name: Install NHC
+      args:
+        chdir: "{{ build_dir }}"
+      shell: make install
+
+    - name: Ensure /etc/nhc exists
+      file:
+        path: /etc/nhc
+        state: directory
+        mode: "0755"
+
+    - name: Generate initial nhc.conf.auto per node (best-effort)
+      shell: /usr/sbin/nhc-genconf -H "*" -c - > /etc/nhc/nhc.conf.auto
+      args:
+        executable: /bin/bash
+      register: genconf_out
+      changed_when: true
+      failed_when: false
+
+    # --- baseline nhc.conf (role-aware) ---
+    - name: Install baseline nhc.conf for controller (slurmctld)
+      copy:
+        dest: /etc/nhc/nhc.conf
+        mode: "0644"
+        content: |
+          # Load custom logwatch module
+          source /etc/nhc/scripts/logwatch.nhc
+          
+          # Container-friendly baseline checks (controller)
+          * || check_fs_mount_rw /
+          * || check_ps_daemon slurmctld slurm
+          * || check_hw_physmem 1k 2TB
+          * || check_hw_swap 0 2TB
+          * || check_hw_swap_free 0
+          * || check_hw_eth eth0
+      when: inventory_hostname in groups['slurm_master']
+
+    - name: Install baseline nhc.conf for compute nodes (slurmd)
+      copy:
+        dest: /etc/nhc/nhc.conf
+        mode: "0644"
+        content: |
+          # Load custom logwatch module
+          source /etc/nhc/scripts/logwatch.nhc
+          
+          # Container-friendly baseline checks (compute)
+          * || check_fs_mount_rw / 
+          * || check_ps_daemon slurmd root
+          * || check_hw_physmem 1k 2TB
+          * || check_hw_swap 0 2TB
+          * || check_hw_swap_free 0
+          * || check_hw_eth eth0
+      when: inventory_hostname in groups['slurm_nodes']
+
+    - name: Ensure /var/log exists (for nhc.log)
+      file:
+        path: /var/log
+        state: directory
+        mode: "0755"
+
+    - name: Dry run NHC with small retries (allow startup jitter)
+      shell: /usr/sbin/nhc
+      register: nhc_first_run
+      changed_when: false
+      retries: 5
+      delay: 2
+      until: nhc_first_run.rc == 0
+
+    - name: Show NHC dry run result
+      debug:
+        var: nhc_first_run
+
+    # ここから追記 ーーーーーーーーーーーーーーーーーーーーーーーーーー
+
+    - name: Ensure NHC scripts dir exists (for custom checks)
+      file:
+        path: /etc/nhc/scripts
+        state: directory
+        mode: "0755"
+
+    - name: Install custom logwatch check module (diff-based, rotation-tolerant)
+      copy:
+        dest: /etc/nhc/scripts/logwatch.nhc
+        mode: "0644"
+        content: |
+          # /etc/nhc/scripts/logwatch.nhc
+          # check_log_matches <監視したいlogfile> <確認したい正規表現regex>
+          # - logfileが無い/読めない時は成功扱い（誤検知回避）
+          # - 前回の読み取り位置を保存し（/var/run/nhc/…）、追記分のみ grep -E <regex>
+          # - ローテーション（inode変化）時は先頭から再読込
+          function check_log_matches() {
+            local LOG="$1"
+            local REGEX="$2"
+            if [[ -z "$LOG" || -z "$REGEX" ]]; then
+              nhc_error "check_log_matches: usage: check_log_matches <logfile> <regex>"
+              return 1
+            fi
+            if [[ ! -r "$LOG" ]]; then
+              return 0
+            fi
+            local STATE_DIR="/var/run/nhc"
+            local BASE="$(basename -- "$LOG")"
+            local STATE="${STATE_DIR}/logwatch.${BASE}.state"
+            mkdir -p "$STATE_DIR"
+            local LAST_INO="" LAST_OFF=""
+            if [[ -f "$STATE" ]]; then
+              read -r LAST_INO LAST_OFF < "$STATE" || true
+            fi
+            local CUR_INO CUR_SIZE
+            CUR_INO="$(stat -Lc '%i' "$LOG" 2>/dev/null || stat -f %i "$LOG")"
+            CUR_SIZE="$(stat -Lc '%s' "$LOG" 2>/dev/null || stat -f %z "$LOG")"
+            local START=0
+            if [[ -n "$LAST_INO" && "$LAST_INO" == "$CUR_INO" && -n "$LAST_OFF" ]]; then
+              START="$LAST_OFF"
+            fi
+            local HIT
+            HIT="$( dd if="$LOG" bs=1 skip="$START" 2>/dev/null | grep -E "$REGEX" || true )"
+            echo "$CUR_INO $CUR_SIZE" > "$STATE"
+            if [[ -n "$HIT" ]]; then
+              nhc_error "check_log_matches: matched in $LOG : $(echo "$HIT" | head -n1)"
+              return 1
+            fi
+            return 0
+          }
+
+    # - name: Ensure basic log-based NHC rules (quick win)
+    #   blockinfile:
+    #     path: /etc/nhc/nhc.conf
+    #     marker: "# {mark} NHC log-based rules"
+    #     block: |
+    #       # 即効性（存在すれば監視／無ければスキップ）
+    #       * || check_file_test -r -s /tmp/nhc_test.log
+    #       * || check_file_contents /tmp/nhc_test.log '/FATAL|PANIC|Out of memory|OOM/'
+
+    #       # dmesg の危険サイン（環境によりノイズが出る場合は調整）
+    #       * || check_cmd_output -m '/(segfault|I\/O error|corruption|Read-only file system)/i' dmesg
+    #       * || check_cmd_output -m '/(Out of memory|oom-killer)/i' dmesg
+
+    #       # 差分監視版（本命）。存在するログだけ評価。
+    #       # * || check_log_matches /var/log/syslog   'FATAL|PANIC|segfault|I/O error|corruption|Read-only file system'
+    #       # * || check_log_matches /var/log/messages 'FATAL|PANIC|segfault|I/O error|corruption|Read-only file system'
+    #       # * || check_log_matches /var/log/kern.log 'segfault|I/O error|corruption|Read-only file system'
+
+    #       # GPU Xid（将来ONに）:
+    #       # * || check_log_matches /var/log/kern.log  '(^| )Xid (31|43|72|79)'
+    #       # * || check_log_matches /var/log/syslog    '(^| )Xid (31|43|72|79)'
+    #   when: inventory_hostname in groups['slurm_nodes'] or inventory_hostname in groups['slurm_master']
+
+    - name: Enable Xid-25 detection rules (syslog/kern.log)
+      blockinfile:
+        path: /etc/nhc/nhc.conf
+        marker: "# {mark} NHC Xid-25 rules"
+        block: |
+          # NVIDIA Xid 25 (ROBUST_CHANNEL_GR_ILLEGAL_NOTIFY) を検知したら失敗扱い
+          # 参考: NVIDIA Xid Catalog
+          # これはどこのファイルにXidエラーが出るのかによるので、OS依存
+          * || check_log_matches /var/log/kern.log  '(^| )Xid (13|48|63|64)'
+          * || check_log_matches /var/log/syslog    '(^| )Xid (13|48|63|64)''
+      when: inventory_hostname in groups['slurm_nodes'] or inventory_hostname in groups['slurm_master']
+
+    - name: Install nhc wrapper that drains node on failure
+      copy:
+        dest: /usr/local/sbin/nhc_wrapper.sh
+        mode: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          LOGDIR=/var/log/nhc
+          mkdir -p "$LOGDIR"
+
+          # 実行（ログはノードごとに残す）
+          # 実行時に参照するファイルは/etc/nhc/nhc.confに記載されている。
+          HOSTNAME="$(hostname -s)"
+          /usr/sbin/nhc -l "$LOGDIR/${HOSTNAME}.log"
+          RC=$?
+
+          if [[ $RC -ne 0 ]]; then
+            REASON="$(tail -n1 "$LOGDIR/${HOSTNAME}.log" 2>/dev/null | sed -e 's/[[:cntrl:]]//g' | cut -c -240)"
+            [[ -z "$REASON" ]] && REASON="NHC failure (see ${LOGDIR}/${HOSTNAME}.log)"
+            # ノード名はSlurmのノード名に合わせる（通常はhostnameと一致）
+            # /user/sbin/nhcで失敗した場合にノードをscontrolコマンドを使ってDRAIN状態にする。
+            /usr/bin/scontrol update nodename="$HOSTNAME" state=drain reason="$REASON" || true
+            exit $RC
+          fi
+
+
+
+- name: Wire Slurm HealthCheck on master and nodes
+  hosts: slurm_master:slurm_nodes
+  gather_facts: false
+  become: false
+  tasks:
+    # Removed duplicate HealthCheckProgram configuration for /usr/sbin/nhc
+    # (keeping only the wrapper script configuration below)
+
+    - name: Set HealthCheckProgram to nhc_wrapper.sh
+      lineinfile:
+        path: /etc/slurm/slurm.conf
+        regexp: '^HealthCheckProgram='
+        line: 'HealthCheckProgram=/usr/local/sbin/nhc_wrapper.sh'
+        insertafter: EOF
+
+    - name: Ensure HealthCheckInterval (e.g., 120s)
+      lineinfile:
+        path: /etc/slurm/slurm.conf
+        regexp: '^HealthCheckInterval='
+        line: 'HealthCheckInterval=120'
+        insertafter: EOF
+
+    - name: Run health checks on ANY state (IDLE/ALLOC/MIXED)
+      lineinfile:
+        path: /etc/slurm/slurm.conf
+        regexp: '^HealthCheckNodeState='
+        line: 'HealthCheckNodeState=ANY'
+        insertafter: EOF
+
+
+
+- name: Reconfigure Slurm controller
+  hosts: slurm_master
+  gather_facts: false
+  become: false
+  tasks:
+    - name: scontrol reconfigure
+      shell: scontrol reconfigure
+      register: reconfig
+      changed_when: "'No change in state' not in reconfig.stdout"
+    - debug:
+        var: reconfig.stdout
