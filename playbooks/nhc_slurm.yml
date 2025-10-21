@@ -134,7 +134,10 @@
           source /etc/nhc/scripts/logwatch.nhc
           
           # Container-friendly baseline checks (controller)
-          * || check_fs_mount_rw /
+          * || check_fs_mount_rw -f /
+          * || check_fs_mount_rw -f /home
+          * || check_fs_mount_rw -f /data
+
           * || check_ps_daemon slurmctld slurm
           * || check_hw_physmem 1k 2TB
           * || check_hw_swap 0 2TB
@@ -151,12 +154,18 @@
           source /etc/nhc/scripts/logwatch.nhc
           
           # Container-friendly baseline checks (compute)
-          * || check_fs_mount_rw / 
+          * || check_fs_mount_rw -f /
+          * || check_fs_mount_rw -f /home
+          * || check_fs_mount_rw -f /data
+
           * || check_ps_daemon slurmd root
           * || check_hw_physmem 1k 2TB
           * || check_hw_swap 0 2TB
           * || check_hw_swap_free 0
           * || check_hw_eth eth0
+
+          # Check for some sort of free memory of either type.
+          * || check_hw_mem_free 1gb
       when: inventory_hostname in groups['slurm_nodes']
 
     - name: Ensure /var/log exists (for nhc.log)
