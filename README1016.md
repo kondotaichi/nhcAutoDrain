@@ -159,7 +159,7 @@ HealthCheckNodeState=ANY
 
 ```bash
 # ノードc1に接続
-docker exec -it slurm-cluster-c1-1 bash
+docker exec -it c1 bash
 
 # テスト用のXidエラーをログに追加
 echo "NVRM: Xid 13: 00/01/00/00: 10de,13c2,1466,1a67, C62, Graphics Engine Exception" >> /var/log/kern.log
@@ -180,10 +180,10 @@ echo $?  # 0以外ならエラー検出
 
 ```bash
 # Slurmコントローラーでノード状態を確認
-docker exec -it slurm-cluster-slurmctld-1 scontrol show node c1
+docker exec -it slurmctld scontrol show node c1
 
 # 期待される結果:
-# State=DRAIN Reason=Xid error detected
+# State=IDLE+DRAIN Reason=Test Xid 13 detection
 ```
 
 ### 3.4 ログの確認
@@ -198,20 +198,12 @@ tail -f /var/log/syslog | grep -i xid
 
 ## 4. 自動ヘルスチェックの確認
 
-### 4.1 ヘルスチェック間隔の確認
-
 Slurmは120秒間隔でヘルスチェックを実行します：
+nhc_slurm.yamlで設定を変更できる。
 
 ```bash
 # ヘルスチェック設定の確認
-docker exec -it slurm-cluster-slurmctld-1 scontrol show config | grep HealthCheck
-```
-
-### 4.2 継続的監視の確認
-
-```bash
-# ノード状態の継続監視
-watch -n 5 'docker exec slurm-cluster-slurmctld-1 scontrol show node c1 | grep State'
+docker exec -it slurmctld scontrol show config | grep HealthCheck
 ```
 
 ## 5. トラブルシューティング
@@ -266,41 +258,7 @@ docker exec -it slurm-cluster-slurmctld-1 scontrol reconfigure
 * || check_cmd_output -m 'MemAvailable.*([0-9]+) kB' cat /proc/meminfo | awk '{if ($2 < 1000000) exit 1}'
 ```
 
-### 6.3 ログローテーションの設定
-
-```bash
-# logrotateの設定例
-cat > /etc/logrotate.d/nhc << EOF
-/var/log/nhc/*.log {
-    daily
-    rotate 7
-    compress
-    delaycompress
-    missingok
-    notifempty
-}
-EOF
-```
-
-## 7. パフォーマンス考慮事項
-
-### 7.1 ヘルスチェック間隔の調整
-
-- **短い間隔**: より迅速なエラー検出、ただしCPU負荷増加
-- **長い間隔**: 低負荷、ただし検出遅延
-
-```bash
-# 間隔を60秒に短縮する場合
-HealthCheckInterval=60
-```
-
-### 7.2 ログ監視の最適化
-
-- 差分監視によりI/O負荷を最小化
-- ログローテーション対応で継続性を確保
-- 存在しないログファイルはスキップ
-
-## 8. まとめ
+## 7. まとめ
 
 このチュートリアルでは、以下の内容を実装しました：
 
