@@ -170,13 +170,9 @@
           * || check_hw_swap 0 2TB
           * || check_hw_swap_free 0
           * || check_hw_eth eth0
-
-<<<<<<< HEAD
           # Everybody needs sshd running, right?  But don't use -r (restart)!
           * || check_ps_service -u root -S sshd:
 
-=======
->>>>>>> 915273f748895337aab3d80e3a56bc6813298620
           # Check for some sort of free memory of either type.
           * || check_hw_mem_free 1gb
       when: inventory_hostname in groups['slurm_nodes']
