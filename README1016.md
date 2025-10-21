@@ -230,7 +230,7 @@ ls -la /var/run/nhc/
 
 ```bash
 # 設定変更後の再設定
-docker exec -it slurm-cluster-slurmctld-1 scontrol reconfigure
+docker exec -it slurmctld scontrol reconfigure
 ```
 
 ## 6. 高度な設定
